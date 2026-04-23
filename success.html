@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PanelSure — Report Processing</title>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Plus+Jakarta+Sans:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#080E1A;color:#F1F5FB;font-family:'Plus Jakarta Sans',sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px}
+.card{max-width:520px;width:100%;background:linear-gradient(180deg,#131C30,#0F1829);border:1px solid #26334F;border-radius:22px;padding:48px 36px;text-align:center}
+.check{width:72px;height:72px;border-radius:50%;background:rgba(34,197,94,.12);border:2px solid #22C55E;display:grid;place-items:center;margin:0 auto 24px;animation:pulse 2s ease infinite}
+.check svg{width:36px;height:36px;color:#22C55E}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.4)}50%{box-shadow:0 0 0 16px rgba(34,197,94,0)}}
+h1{font-family:'Bebas Neue',sans-serif;font-size:32px;letter-spacing:.04em;margin-bottom:8px}
+.sub{color:#8A97B2;font-size:15px;line-height:1.55;margin-bottom:32px}
+.steps{display:flex;flex-direction:column;gap:12px;text-align:left;margin-bottom:32px}
+.step{display:flex;align-items:center;gap:14px;padding:14px 16px;border-radius:12px;border:1px solid #1C2742;background:#0B1324}
+.step-icon{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;flex-shrink:0}
+.step-done .step-icon{background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.4);color:#22C55E}
+.step-active .step-icon{background:rgba(245,183,49,.15);border:1px solid rgba(245,183,49,.4);color:#F5B731;animation:pulse-amber 1.5s ease infinite}
+.step-pending .step-icon{background:rgba(138,151,178,.1);border:1px solid #1C2742;color:#8A97B2}
+@keyframes pulse-amber{0%,100%{box-shadow:0 0 0 0 rgba(245,183,49,.3)}50%{box-shadow:0 0 0 10px rgba(245,183,49,0)}}
+.step-label{font-size:14px;font-weight:600}
+.step-desc{font-size:12px;color:#8A97B2;margin-top:2px}
+.mono{font-family:'JetBrains Mono',monospace}
+.ref{margin-top:24px;padding:12px 16px;border-radius:10px;background:#0B1324;border:1px solid #1C2742;font-size:12px;color:#8A97B2}
+.ref span{color:#F5B731;font-weight:600}
+.back{margin-top:20px;color:#8A97B2;font-size:14px;text-decoration:none}
+.back:hover{color:#F1F5FB}
+.footer{margin-top:32px;font-size:11px;color:#6B788F;text-align:center;max-width:400px}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="check">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg>
+  </div>
+  <h1>PAYMENT RECEIVED</h1>
+  <p class="sub">Your AI safety audit is being generated. You'll receive your PDF report by email within 5 minutes.</p>
+
+  <div class="steps">
+    <div class="step step-done">
+      <div class="step-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg>
+      </div>
+      <div>
+        <div class="step-label">Payment received</div>
+        <div class="step-desc">$19.00 processed successfully</div>
+      </div>
+    </div>
+    <div class="step step-active">
+      <div class="step-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+      </div>
+      <div>
+        <div class="step-label">AI analyzing your panel</div>
+        <div class="step-desc">Vision analysis + NEC 220.82 load calculation in progress</div>
+      </div>
+    </div>
+    <div class="step step-pending">
+      <div class="step-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3h8l4 4v14H7z"/><path d="M15 3v4h4"/><path d="M10 12h7M10 16h7"/></svg>
+      </div>
+      <div>
+        <div class="step-label">PDF report delivered</div>
+        <div class="step-desc">Emailed to you + shareable link</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="ref mono">
+    Reference: <span id="refId">—</span>
+  </div>
+
+  <a href="/" class="back">← Back to PanelSure</a>
+</div>
+
+<div class="footer">
+  PanelSure.com — AI-Powered Electrical Safety Audits<br>
+  Questions? Email hello@panelsure.com
+</div>
+
+<script>
+  // Extract session ID from URL and show last 12 chars as reference
+  const params = new URLSearchParams(window.location.search);
+  const sessionId = params.get("session_id") || "";
+  if (sessionId) {
+    document.getElementById("refId").textContent = sessionId.slice(-12).toUpperCase();
+  }
+</script>
+</body>
+</html>
