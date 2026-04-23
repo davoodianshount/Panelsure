@@ -1,0 +1,396 @@
+"""
+PanelSure — Vision AI System Prompt & Panel Analysis Pipeline
+
+This module contains:
+1. The system prompt for Claude/Gemini vision analysis of electrical panels
+2. The structured output format (JSON)
+3. Example usage with the Anthropic API
+
+USAGE:
+    from panelsure_vision import get_system_prompt, parse_vision_response
+    
+    # Send to Claude API with the panel photo
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2000,
+        system=get_system_prompt(),
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64_image}},
+                {"type": "text", "text": "Analyze this electrical panel photo."}
+            ]
+        }]
+    )
+"""
+
+import json
+
+
+def get_system_prompt() -> str:
+    """
+    Returns the system prompt for the panel vision analysis.
+    
+    This prompt is designed to extract structured data from electrical panel photos.
+    The AI acts as a "digital electrician" — it SEES, but does not CALCULATE.
+    All math is done deterministically in the NEC engine.
+    """
+    return """You are PanelSure's AI Panel Inspector — a specialized electrical panel analysis system. You analyze photos of residential electrical panels to extract structured safety data.
+
+## YOUR ROLE
+You are the EYES of the system. You identify what you SEE. You do NOT calculate loads, determine code compliance, or make recommendations. You extract visual data and return it as structured JSON. A separate deterministic engine handles all NEC calculations and safety grading.
+
+## WHAT YOU ANALYZE
+
+### Photo Type 1: Panel with Door CLOSED (exterior)
+Look for:
+- **Brand name** on the panel door label or sticker
+- **Model number** if visible
+- **Safety certification stickers** (UL, ETL)
+- **Warning labels**
+- **Panel door condition** (rust, dents, paint-over)
+- **Location context** (garage, closet, bathroom, exterior)
+
+### Photo Type 2: Panel with Door OPEN (interior / breakers)
+Look for:
+- **Main breaker amperage** (the large breaker at top, usually labeled 100A, 150A, or 200A)
+- **Individual breakers**: Count and categorize each one:
+  - Single pole (15A, 20A)
+  - Double pole (30A, 40A, 50A)
+  - Tandem/twin breakers
+  - AFCI breakers (usually have a TEST button and "AFCI" label)
+  - GFCI breakers (usually have a TEST button and "GFCI" label)
+- **Breaker brand identification** (critical for hazard detection):
+  - Zinsco: distinctive colored breakers (pink, green, red, blue)
+  - Federal Pacific Stab-Lok: black/red breakers with distinctive rectangular shape
+  - Pushmatic: push-button style (no toggle switch)
+- **Empty/unused breaker slots** (spaces available for new circuits)
+- **Visual hazards**:
+  - Scorching, burn marks, or discoloration on the bus bar or breakers
+  - Corrosion (green/white deposits)
+  - Double-tapped breakers (two wires on one breaker)
+  - Melted or damaged wire insulation
+  - Missing knockout covers (open holes in the panel box)
+  - Exposed bare copper/aluminum conductors
+  - Evidence of aluminum branch wiring (silver-colored wire, especially on 15A/20A circuits)
+  - Improper grounding (missing ground wire, improper bonding)
+  - Oversized breakers for wire gauge (e.g., 20A breaker on 14 AWG wire)
+  - Signs of amateur/DIY work
+
+### Photo Type 3: Meter / Service Entrance (exterior)
+Look for:
+- **Meter type** and amp rating (often printed on the meter face: CL200, CL320)
+- **Service wire gauge** (if visible at the weatherhead)
+- **Utility company markings**
+- **Condition of the mast and weatherhead**
+
+## OUTPUT FORMAT
+Return ONLY valid JSON. No markdown, no backticks, no explanation text.
+
+{
+  "analysis_type": "panel_closed" | "panel_open" | "meter" | "unknown",
+  "confidence": 0.0-1.0,
+  "photo_quality": "excellent" | "good" | "fair" | "poor" | "unusable",
+  "photo_quality_issues": ["list of issues if not excellent"],
+
+  "brand": {
+    "detected": "Brand Name" | null,
+    "confidence": 0.0-1.0,
+    "model": "Model number if visible" | null,
+    "is_zinsco": true/false,
+    "is_federal_pacific": true/false,
+    "is_pushmatic": true/false,
+    "is_challenger": true/false,
+    "evidence": "What visual cues led to this identification"
+  },
+
+  "main_breaker": {
+    "detected": true/false,
+    "amperage": 100 | 125 | 150 | 200 | null,
+    "type": "main_breaker" | "main_lug_only" | null,
+    "confidence": 0.0-1.0
+  },
+
+  "breakers": {
+    "total_count": 0,
+    "single_pole_15a": 0,
+    "single_pole_20a": 0,
+    "double_pole_30a": 0,
+    "double_pole_40a": 0,
+    "double_pole_50a": 0,
+    "double_pole_60a": 0,
+    "tandem_breakers": 0,
+    "afci_breakers": 0,
+    "gfci_breakers": 0,
+    "empty_slots": 0,
+    "unreadable": 0,
+    "confidence": 0.0-1.0,
+    "notes": "Any relevant observations about breaker arrangement"
+  },
+
+  "hazards_detected": [
+    {
+      "type": "scorching" | "corrosion" | "double_tap" | "melted_wire" | "missing_knockouts" | "improper_grounding" | "aluminum_wiring" | "exposed_conductors" | "oversized_breaker" | "diy_work" | "other",
+      "severity": "critical" | "high" | "moderate" | "low",
+      "location": "Description of where in the panel",
+      "confidence": 0.0-1.0,
+      "description": "What you see"
+    }
+  ],
+
+  "panel_location": {
+    "detected": "garage" | "basement" | "utility_room" | "closet" | "bathroom" | "bedroom" | "kitchen" | "exterior" | "unknown",
+    "potential_code_violation": true/false,
+    "violation_reason": "e.g., Panel located in clothes closet (NEC 240.24)" | null
+  },
+
+  "meter": {
+    "amp_rating": "CL200" | "CL320" | null,
+    "type": "analog" | "digital" | "smart" | null,
+    "condition": "good" | "fair" | "poor" | null
+  },
+
+  "age_indicators": {
+    "estimated_decade": "1970s" | "1980s" | "1990s" | "2000s" | "2010s" | "2020s" | null,
+    "evidence": "What visual cues suggest this age",
+    "confidence": 0.0-1.0
+  },
+
+  "solar_ready": {
+    "has_solar_sticker": true/false,
+    "is_center_fed": true/false | null,
+    "has_space_for_gateway": true/false | null,
+    "notes": "Any observations about solar readiness"
+  },
+
+  "additional_observations": "Any other relevant findings not captured above"
+}
+
+## CRITICAL RULES
+
+1. **NEVER HALLUCINATE**: If you cannot clearly see something, set its value to null and confidence to 0. A wrong identification of a safe panel brand as Zinsco could cause unnecessary panic. A wrong identification of Zinsco as safe could endanger lives.
+
+2. **BREAKER COUNTING**: Count carefully. If breakers are partially obscured, note the count as approximate and reduce confidence. Include the count of unreadable breakers.
+
+3. **BRAND DETECTION PRIORITY**: This is the highest-stakes determination. Zinsco and Federal Pacific are FIRE HAZARDS. Look for:
+   - Zinsco: Multi-colored breakers (pink, green, red, blue), "Sylvania" label, distinctive bus bar design
+   - FPE: "Stab-Lok" marking, "Federal Pacific Electric" label, rectangular black/red breakers
+   - If uncertain between a hazardous and non-hazardous brand, state BOTH possibilities with confidence levels
+
+4. **PHOTO QUALITY**: If the photo is too blurry, dark, or poorly framed to make reliable determinations, say so. Set photo_quality to "poor" or "unusable" and explain what's wrong. It's better to request a retake than to guess.
+
+5. **DOUBLE TAPS**: These are when two wires are connected to a single breaker terminal. Look carefully at each breaker connection point. This is a common and important hazard to catch.
+
+6. **ALUMINUM WIRING**: Look for silver-colored wires (as opposed to copper's orange/brown) on branch circuits (15A/20A breakers). Aluminum wiring on branch circuits is a significant fire risk.
+
+7. **DO NOT DIAGNOSE**: You identify. You don't diagnose, recommend, or calculate. Your output feeds a deterministic safety engine. Stick to observations."""
+
+
+def get_photo_guidance() -> dict:
+    """Returns guidance text for the user's photo upload UI."""
+    return {
+        "photo_1": {
+            "title": "Panel Door (Closed)",
+            "instruction": "Take a straight-on photo of your panel with the door closed. Make sure the brand label and any stickers are visible.",
+            "overlay_text": "Center the panel door label here",
+            "tips": [
+                "Good lighting — use your phone flashlight if needed",
+                "Hold phone straight (not at an angle)",
+                "Include the full panel door in the frame",
+            ],
+        },
+        "photo_2": {
+            "title": "Breakers (Door Open)",
+            "instruction": "Open the panel door and photograph all the breakers. The main breaker at the top is most important.",
+            "overlay_text": "Center the main breaker here",
+            "tips": [
+                "Get ALL breakers in one shot if possible",
+                "Focus on the main breaker label (100A / 200A)",
+                "Make sure breaker labels are readable",
+                "Don't touch any wires or breakers",
+            ],
+        },
+        "photo_3": {
+            "title": "Meter (Exterior)",
+            "instruction": "Go outside and photograph your electric meter. Include the meter face and any visible labels.",
+            "overlay_text": "Center the meter face here",
+            "tips": [
+                "Include the amp rating label (usually says CL200)",
+                "Photograph in daylight if possible",
+                "Include the wires going up to the weatherhead if visible",
+            ],
+        },
+    }
+
+
+def parse_vision_response(response_text: str) -> dict:
+    """
+    Parse the AI's JSON response and validate required fields.
+    Returns the parsed data or raises ValueError.
+    """
+    # Strip any accidental markdown fencing
+    text = response_text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    text = text.strip()
+    if text.startswith("json"):
+        text = text[4:].strip()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"AI response was not valid JSON: {e}")
+
+    # Validate required fields
+    required = ["analysis_type", "confidence", "photo_quality", "brand"]
+    for field in required:
+        if field not in data:
+            raise ValueError(f"Missing required field: {field}")
+
+    # Extract hazard types for the safety grading engine
+    hazard_types = []
+    if "hazards_detected" in data and data["hazards_detected"]:
+        for h in data["hazards_detected"]:
+            if h.get("confidence", 0) >= 0.6:
+                hazard_types.append(h["type"])
+
+    data["_extracted_hazard_types"] = hazard_types
+
+    # Extract brand for safety engine
+    brand_info = data.get("brand", {})
+    if brand_info.get("is_zinsco"):
+        data["_brand_key"] = "zinsco"
+    elif brand_info.get("is_federal_pacific"):
+        data["_brand_key"] = "federal_pacific"
+    elif brand_info.get("is_pushmatic"):
+        data["_brand_key"] = "pushmatic"
+    elif brand_info.get("is_challenger"):
+        data["_brand_key"] = "challenger"
+    else:
+        data["_brand_key"] = (brand_info.get("detected") or "unknown").lower().replace(" ", "_")
+
+    return data
+
+
+# ============================================================
+# EXAMPLE: Full Pipeline (pseudo-code for reference)
+# ============================================================
+PIPELINE_EXAMPLE = """
+# --- Full PanelSure Pipeline ---
+
+import anthropic
+from panelsure_vision import get_system_prompt, parse_vision_response
+from panelsure_report_v2 import (
+    calculate_nec_220_82,
+    calculate_safety_grade,
+    generate_quote,
+    generate_report_pdf,
+)
+
+# 1. User uploads photos + fills out questionnaire
+user_data = {
+    "name": "John Martinez",
+    "address": "4521 Oak Valley Dr, Los Angeles, CA 90041",
+    "sq_ft": 2100,
+    "zip_code": "90041",
+    "appliances": {
+        "electric_dryer": 5000,
+        "water_heater": 4500,
+        "dishwasher": 1800,
+        "oven_range": 12000,
+        "garbage_disposal": 900,
+        "microwave": 1500,
+        "washer": 500,
+    },
+    "hvac_watts": 5000,
+    "heat_watts": 0,
+}
+
+# 2. Send panel photo to Claude Vision
+client = anthropic.Anthropic()
+vision_response = client.messages.create(
+    model="claude-sonnet-4-20250514",
+    max_tokens=2000,
+    system=get_system_prompt(),
+    messages=[{
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": "<base64_encoded_panel_photo>"
+                }
+            },
+            {"type": "text", "text": "Analyze this electrical panel photo."}
+        ]
+    }]
+)
+
+# 3. Parse the vision output
+panel_data = parse_vision_response(
+    vision_response.content[0].text
+)
+
+# 4. Run NEC calculation (deterministic — no AI)
+calc = calculate_nec_220_82(
+    sq_ft=user_data["sq_ft"],
+    appliances=user_data["appliances"],
+    hvac_watts=user_data["hvac_watts"],
+    heat_watts=user_data["heat_watts"],
+)
+
+# 5. Run safety grading
+safety = calculate_safety_grade(
+    brand=panel_data["brand"]["detected"],
+    panel_age_years=2026 - int(panel_data["age_indicators"]["estimated_decade"][:4]),
+    main_breaker_amps=panel_data["main_breaker"]["amperage"] or 100,
+    total_load_amps=calc["total_amps"],
+    hazards_detected=panel_data["_extracted_hazard_types"],
+)
+
+# 6. Generate quote
+quote = generate_quote(
+    brand=panel_data["_brand_key"],
+    main_amps=panel_data["main_breaker"]["amperage"] or 100,
+    circuit_count=panel_data["breakers"]["total_count"],
+)
+
+# 7. Generate PDF report
+generate_report_pdf(
+    output_path=f"/reports/{user_data['name'].replace(' ', '_')}.pdf",
+    customer_name=user_data["name"],
+    address=user_data["address"],
+    calc_result=calc,
+    safety_result=safety,
+    quote_result=quote,
+    panel_brand=panel_data["brand"]["detected"],
+    panel_age=2026 - int(panel_data["age_indicators"]["estimated_decade"][:4]),
+    main_breaker=panel_data["main_breaker"]["amperage"] or 100,
+)
+
+# 8. If Grade F → fire webhook to CRM / SMS
+if safety["grade"] == "F":
+    send_urgent_lead_alert(
+        name=user_data["name"],
+        phone=user_data["phone"],
+        grade="F",
+        brand=panel_data["brand"]["detected"],
+        quote_range=f"${quote['price_low']:,} — ${quote['price_high']:,}",
+    )
+"""
+
+if __name__ == "__main__":
+    print("=== PANELSURE VISION SYSTEM PROMPT ===")
+    print(f"Prompt length: {len(get_system_prompt())} chars")
+    print()
+    print("=== PHOTO GUIDANCE ===")
+    guidance = get_photo_guidance()
+    for key, info in guidance.items():
+        print(f"  {info['title']}: {info['instruction'][:60]}...")
+    print()
+    print("=== PIPELINE EXAMPLE ===")
+    print(PIPELINE_EXAMPLE)

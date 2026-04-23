@@ -1,0 +1,458 @@
+"""
+PanelSure — Lead Routing & Instant Response System
+
+When a report generates, this module:
+1. Scores the lead (Grade F + Zinsco = URGENT)
+2. Fires SMS to Sam via Twilio (within seconds)
+3. Sends auto-text to customer ("Hey John — I just saw your report...")
+4. Pushes lead data to CRM (Benji or any webhook endpoint)
+5. Logs everything
+
+SETUP:
+    pip install twilio requests
+
+ENV VARS NEEDED:
+    TWILIO_ACCOUNT_SID
+    TWILIO_AUTH_TOKEN
+    TWILIO_FROM_NUMBER    (your Twilio number)
+    SAM_PHONE_NUMBER      (Sam's cell — receives urgent alerts)
+    CRM_WEBHOOK_URL       (e.g., https://www.benji.biz/api/webhooks/leads)
+    CRM_BEARER_TOKEN      (auth token for CRM)
+    PANELSURE_BASE_URL    (e.g., https://panelsure.com)
+"""
+
+import os
+import json
+import logging
+from datetime import datetime
+from typing import Optional
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# These would come from environment variables in production
+CONFIG = {
+    "twilio_sid": os.getenv("TWILIO_ACCOUNT_SID", ""),
+    "twilio_token": os.getenv("TWILIO_AUTH_TOKEN", ""),
+    "twilio_from": os.getenv("TWILIO_FROM_NUMBER", ""),
+    "sam_phone": os.getenv("SAM_PHONE_NUMBER", ""),
+    "crm_webhook": os.getenv("CRM_WEBHOOK_URL", "https://www.benji.biz/api/webhooks/leads"),
+    "crm_token": os.getenv("CRM_BEARER_TOKEN", ""),
+    "base_url": os.getenv("PANELSURE_BASE_URL", "https://panelsure.com"),
+    "calendly_url": os.getenv("CALENDLY_URL", "https://calendly.com/panelsure/site-visit"),
+}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("panelsure.leads")
+
+
+# ============================================================
+# 1. LEAD SCORING
+# ============================================================
+
+def score_lead(safety_result: dict, quote_result: dict, user_data: dict) -> dict:
+    """
+    Score a lead based on report findings.
+    Returns priority level and routing instructions.
+    
+    Priority levels:
+        URGENT  = Grade F, fire hazard → call within 5 minutes
+        HOT     = Grade D, high risk  → call within 1 hour
+        WARM    = Grade C, fair       → call within 24 hours
+        NURTURE = Grade A/B           → email drip only
+    """
+    score = 0
+    flags = []
+
+    # Grade-based scoring
+    grade = safety_result.get("grade", "C")
+    if grade == "F":
+        score += 50
+        flags.append("GRADE_F")
+    elif grade == "D":
+        score += 30
+        flags.append("GRADE_D")
+    elif grade == "C":
+        score += 15
+        flags.append("GRADE_C")
+
+    # Fire hazard = instant escalation
+    if safety_result.get("is_fire_hazard"):
+        score += 30
+        flags.append("FIRE_HAZARD")
+
+    # Insurance risk = forced compliance
+    if safety_result.get("insurance_flag"):
+        score += 15
+        flags.append("INSURANCE_RISK")
+
+    # Home sale risk = time pressure
+    if safety_result.get("home_sale_flag"):
+        score += 10
+        flags.append("HOME_SALE_RISK")
+
+    # Capacity overload
+    if safety_result.get("capacity_pct", 0) > 95:
+        score += 15
+        flags.append("OVERLOADED")
+
+    # High-value job (relocation, service upgrade)
+    if quote_result.get("includes_relocation"):
+        score += 5
+        flags.append("RELOCATION_NEEDED")
+    if quote_result.get("includes_service_upgrade"):
+        score += 5
+        flags.append("SERVICE_UPGRADE")
+
+    # EV / Solar planning = future upsell
+    if user_data.get("has_ev") or user_data.get("planning_solar"):
+        score += 5
+        flags.append("FUTURE_LOAD")
+
+    # Determine priority
+    if score >= 70:
+        priority = "URGENT"
+        response_target = "5 minutes"
+        action = "CALL_NOW"
+    elif score >= 40:
+        priority = "HOT"
+        response_target = "1 hour"
+        action = "CALL_SOON"
+    elif score >= 20:
+        priority = "WARM"
+        response_target = "24 hours"
+        action = "CALL_TODAY"
+    else:
+        priority = "NURTURE"
+        response_target = "48 hours"
+        action = "EMAIL_DRIP"
+
+    return {
+        "score": min(score, 100),
+        "priority": priority,
+        "response_target": response_target,
+        "action": action,
+        "flags": flags,
+        "estimated_job_value": f"${quote_result.get('price_low', 0):,}–${quote_result.get('price_high', 0):,}",
+    }
+
+
+# ============================================================
+# 2. SMS ALERTS (Twilio)
+# ============================================================
+
+def send_sms(to_number: str, message: str) -> dict:
+    """Send SMS via Twilio. Returns status or error."""
+    try:
+        from twilio.rest import Client
+        client = Client(CONFIG["twilio_sid"], CONFIG["twilio_token"])
+        msg = client.messages.create(
+            body=message,
+            from_=CONFIG["twilio_from"],
+            to=to_number,
+        )
+        logger.info(f"SMS sent to {to_number}: SID={msg.sid}")
+        return {"success": True, "sid": msg.sid, "status": msg.status}
+    except ImportError:
+        logger.warning("Twilio not installed. SMS skipped.")
+        return {"success": False, "error": "twilio not installed"}
+    except Exception as e:
+        logger.error(f"SMS failed to {to_number}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def alert_sam(lead_data: dict, safety_result: dict, quote_result: dict, lead_score: dict) -> dict:
+    """
+    Fire urgent SMS to Sam when a high-priority lead comes in.
+    This is the "speed to lead" play — Sam gets a text within seconds.
+    """
+    name = lead_data.get("first_name", "Customer")
+    address = lead_data.get("address", "Unknown")
+    brand = safety_result.get("fire_warning", "").replace("THIS PANEL TYPE HAS BEEN LINKED TO ELECTRICAL FIRES", "").strip()
+    grade = safety_result.get("grade", "?")
+    anchor = quote_result.get("anchor_price", 0)
+
+    # Different message templates based on priority
+    if lead_score["priority"] == "URGENT":
+        message = (
+            f"🔴 URGENT PANELSURE LEAD\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"Name: {lead_data.get('first_name', '')} {lead_data.get('last_name', '')}\n"
+            f"Phone: {lead_data.get('phone', 'N/A')}\n"
+            f"Address: {address}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"Grade: F | FIRE HAZARD\n"
+            f"Brand: {lead_data.get('panel_brand', 'Zinsco/FPE')}\n"
+            f"Quote: {lead_score['estimated_job_value']}\n"
+            f"Anchor: ${anchor:,}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"⚡ CALL NOW — customer is viewing report"
+        )
+    elif lead_score["priority"] == "HOT":
+        message = (
+            f"🟠 HOT PANELSURE LEAD\n"
+            f"{lead_data.get('first_name', '')} {lead_data.get('last_name', '')} | Grade {grade}\n"
+            f"Phone: {lead_data.get('phone', 'N/A')}\n"
+            f"Address: {address}\n"
+            f"Quote: {lead_score['estimated_job_value']}\n"
+            f"Call within 1 hour"
+        )
+    else:
+        message = (
+            f"🟡 PANELSURE LEAD\n"
+            f"{lead_data.get('first_name', '')} {lead_data.get('last_name', '')} | Grade {grade}\n"
+            f"Phone: {lead_data.get('phone', 'N/A')}\n"
+            f"Quote: {lead_score['estimated_job_value']}"
+        )
+
+    return send_sms(CONFIG["sam_phone"], message)
+
+
+def auto_text_customer(lead_data: dict, safety_result: dict, quote_result: dict) -> dict:
+    """
+    Send an immediate follow-up text to the customer.
+    This is the "Hey John — I just saw your report" message.
+    
+    Only fires for URGENT and HOT leads with a phone number.
+    """
+    phone = lead_data.get("phone", "")
+    if not phone:
+        return {"success": False, "error": "no phone number"}
+
+    first_name = lead_data.get("first_name", "there")
+    grade = safety_result.get("grade", "")
+    calendly = CONFIG["calendly_url"]
+
+    if grade == "F":
+        message = (
+            f"Hi {first_name} — Sam from PanelSure. "
+            f"I just reviewed your report — that panel is a fire risk. "
+            f"I have an opening today or tomorrow to take a look. "
+            f"Want me to stop by? {calendly}"
+        )
+    elif grade == "D":
+        message = (
+            f"Hi {first_name} — Sam from PanelSure. "
+            f"Your panel report flagged some concerns. "
+            f"I can take a quick look — no cost, no pressure. "
+            f"Book here: {calendly}"
+        )
+    else:
+        # Grade C or better — don't auto-text, use email drip
+        return {"success": False, "reason": "grade_too_high_for_auto_text"}
+
+    return send_sms(phone, message)
+
+
+def missed_call_text(lead_data: dict, safety_result: dict) -> dict:
+    """
+    Send when Sam calls and customer doesn't answer.
+    Triggered manually or after the 3rd call attempt fails.
+    """
+    phone = lead_data.get("phone", "")
+    if not phone:
+        return {"success": False, "error": "no phone number"}
+
+    first_name = lead_data.get("first_name", "there")
+    brand = lead_data.get("panel_brand", "that panel")
+
+    message = (
+        f"Hey {first_name} — tried calling. Just reviewed your panel report. "
+        f"That {brand} panel is something I'd recommend addressing ASAP. "
+        f"Want me to take a quick look? No charge."
+    )
+    return send_sms(phone, message)
+
+
+# ============================================================
+# 3. CRM PUSH (Benji or generic webhook)
+# ============================================================
+
+def push_to_crm(lead_data: dict, safety_result: dict, calc_result: dict,
+                quote_result: dict, lead_score: dict, report_id: str) -> dict:
+    """
+    Push lead data to CRM via webhook.
+    Formatted for Benji CRM but works with any webhook that accepts JSON POST.
+    """
+    import requests
+
+    # Build Benji-compatible payload
+    payload = {
+        "firstName": lead_data.get("first_name", ""),
+        "lastName": lead_data.get("last_name", ""),
+        "email": lead_data.get("email", ""),
+        "phone": lead_data.get("phone", ""),
+        "address": lead_data.get("address", ""),
+        "source": "PanelSure AI Audit",
+        "metadata": {
+            "report_id": report_id,
+            "safety_grade": safety_result.get("grade"),
+            "safety_score": safety_result.get("score"),
+            "is_fire_hazard": safety_result.get("is_fire_hazard"),
+            "insurance_risk": safety_result.get("insurance_flag"),
+            "home_sale_risk": safety_result.get("home_sale_flag"),
+            "panel_brand": lead_data.get("panel_brand", ""),
+            "panel_age": lead_data.get("panel_age", ""),
+            "main_breaker_amps": lead_data.get("main_breaker", ""),
+            "total_load_amps": calc_result.get("total_amps"),
+            "capacity_pct": safety_result.get("capacity_pct"),
+            "lifespan": safety_result.get("lifespan"),
+            "quote_low": quote_result.get("price_low"),
+            "quote_high": quote_result.get("price_high"),
+            "anchor_price": quote_result.get("anchor_price"),
+            "lead_score": lead_score.get("score"),
+            "lead_priority": lead_score.get("priority"),
+            "lead_flags": lead_score.get("flags"),
+            "sq_ft": lead_data.get("sq_ft"),
+            "zip_code": lead_data.get("zip_code"),
+            "has_ev": lead_data.get("has_ev"),
+            "planning_solar": lead_data.get("planning_solar"),
+            "hazards_detected": [rf["detail"] for rf in safety_result.get("risk_factors", [])],
+        },
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if CONFIG["crm_token"]:
+        headers["Authorization"] = f"Bearer {CONFIG['crm_token']}"
+
+    try:
+        resp = requests.post(CONFIG["crm_webhook"], json=payload, headers=headers, timeout=10)
+        logger.info(f"CRM push: {resp.status_code}")
+        return {"success": resp.status_code in [200, 201], "status": resp.status_code}
+    except Exception as e:
+        logger.error(f"CRM push failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ============================================================
+# 4. MASTER ROUTING FUNCTION
+# ============================================================
+
+def route_lead(
+    lead_data: dict,
+    safety_result: dict,
+    calc_result: dict,
+    quote_result: dict,
+    report_id: str,
+) -> dict:
+    """
+    Master function called after every report is generated.
+    Scores the lead, routes it to the right channel, and logs everything.
+    
+    This is what you call from your API endpoint after PDF generation.
+    
+    Returns a summary of all actions taken.
+    """
+    logger.info(f"=== ROUTING LEAD: {report_id} ===")
+
+    # Step 1: Score
+    lead_score = score_lead(safety_result, quote_result, lead_data)
+    logger.info(f"Lead score: {lead_score['score']} | Priority: {lead_score['priority']} | "
+                f"Flags: {lead_score['flags']}")
+
+    results = {
+        "report_id": report_id,
+        "lead_score": lead_score,
+        "actions_taken": [],
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    # Step 2: Alert Sam (URGENT and HOT only)
+    if lead_score["priority"] in ["URGENT", "HOT"]:
+        sam_result = alert_sam(lead_data, safety_result, quote_result, lead_score)
+        results["sms_to_sam"] = sam_result
+        results["actions_taken"].append(f"SMS to Sam: {sam_result.get('success')}")
+        logger.info(f"Sam SMS: {sam_result}")
+
+    # Step 3: Auto-text customer (URGENT and HOT with phone)
+    if lead_score["priority"] in ["URGENT", "HOT"] and lead_data.get("phone"):
+        customer_result = auto_text_customer(lead_data, safety_result, quote_result)
+        results["sms_to_customer"] = customer_result
+        results["actions_taken"].append(f"Auto-text to customer: {customer_result.get('success')}")
+        logger.info(f"Customer SMS: {customer_result}")
+
+    # Step 4: CRM push (all leads)
+    crm_result = push_to_crm(lead_data, safety_result, calc_result, quote_result, lead_score, report_id)
+    results["crm_push"] = crm_result
+    results["actions_taken"].append(f"CRM push: {crm_result.get('success')}")
+    logger.info(f"CRM push: {crm_result}")
+
+    logger.info(f"=== ROUTING COMPLETE: {len(results['actions_taken'])} actions ===")
+    return results
+
+
+# ============================================================
+# 5. EXAMPLE / TEST
+# ============================================================
+
+if __name__ == "__main__":
+    # Simulate a Grade F Zinsco lead
+    from panelsure_report_v2 import calculate_nec_220_82, calculate_safety_grade, generate_quote
+
+    appliances = {
+        "electric_dryer": 5000, "water_heater": 4500, "dishwasher": 1800,
+        "oven_range": 12000, "garbage_disposal": 900, "microwave": 1500, "washer": 500,
+    }
+
+    calc = calculate_nec_220_82(sq_ft=2100, appliances=appliances, hvac_watts=5000)
+    safety = calculate_safety_grade(
+        brand="Zinsco", panel_age_years=42, main_breaker_amps=100,
+        total_load_amps=calc["total_amps"], hazards_detected=["double_tap", "corrosion"],
+    )
+    quote = generate_quote(brand="Zinsco", main_amps=100, circuit_count=24)
+
+    lead_data = {
+        "first_name": "John",
+        "last_name": "Martinez",
+        "email": "john@example.com",
+        "phone": "+13105551234",
+        "address": "4521 Oak Valley Dr, Los Angeles, CA 90041",
+        "sq_ft": 2100,
+        "zip_code": "90041",
+        "has_ev": True,
+        "planning_solar": False,
+        "panel_brand": "Zinsco",
+        "panel_age": 42,
+        "main_breaker": 100,
+    }
+
+    # Score only (no actual SMS/CRM in test)
+    lead_score = score_lead(safety, quote, lead_data)
+
+    print("=" * 60)
+    print("LEAD ROUTING TEST")
+    print("=" * 60)
+    print(f"  Lead Score:    {lead_score['score']}/100")
+    print(f"  Priority:      {lead_score['priority']}")
+    print(f"  Response:      {lead_score['response_target']}")
+    print(f"  Action:        {lead_score['action']}")
+    print(f"  Job Value:     {lead_score['estimated_job_value']}")
+    print(f"  Flags:         {', '.join(lead_score['flags'])}")
+    print()
+
+    # Show what SMS would look like
+    print("=" * 60)
+    print("SAM'S SMS (would send):")
+    print("=" * 60)
+    name = f"{lead_data['first_name']} {lead_data['last_name']}"
+    print(f"  🔴 URGENT PANELSURE LEAD")
+    print(f"  Name: {name}")
+    print(f"  Phone: {lead_data['phone']}")
+    print(f"  Address: {lead_data['address']}")
+    print(f"  Grade: F | FIRE HAZARD")
+    print(f"  Brand: Zinsco")
+    print(f"  Quote: {lead_score['estimated_job_value']}")
+    print(f"  Anchor: ${quote['anchor_price']:,}")
+    print(f"  ⚡ CALL NOW — customer is viewing report")
+    print()
+    print("=" * 60)
+    print("CUSTOMER AUTO-TEXT (would send):")
+    print("=" * 60)
+    print(f"  Hi John — this is Sam from PanelSure.")
+    print(f"  I just reviewed your safety report and that panel is a serious risk.")
+    print(f"  I can do a free site verification today or tomorrow.")
+    print(f"  Want me to swing by?")
+    print(f"  Book here: {CONFIG['calendly_url']}")
